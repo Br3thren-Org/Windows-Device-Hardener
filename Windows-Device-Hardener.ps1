@@ -354,6 +354,7 @@ function Set-RegistryProperty {
 function Log {
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string]$Message,
         [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
         [string]$Level = "INFO"
@@ -403,7 +404,7 @@ function Export-RegistryPath {
         $backupFile = Join-Path $script:BackupPath "$BackupName.reg"
         $regPath = $RegistryPath -replace "^HKEY_LOCAL_MACHINE", "HKLM"
         
-        $result = Start-Process -FilePath "reg.exe" -ArgumentList @("export", $regPath, $backupFile, "/y") -Wait -PassThru -NoNewWindow
+        $result = Start-Process -FilePath "reg.exe" -ArgumentList @("export", "`"$regPath`"", "`"$backupFile`"", "/y") -Wait -PassThru -NoNewWindow
         
         if ($result.ExitCode -eq 0) {
             Log "Registry backup created: $backupFile" "SUCCESS"
@@ -706,8 +707,15 @@ function Set-ASRRules {
     # Enable ASR rules (merge + verify Block actions with deterministic ordering)
     Do-Change -Description "Enable ASR Rules (merge + verify actions)" -TestScript {
         $preference = Get-MpPrefSafe
-        $currentRules = @($preference.AttackSurfaceReductionRules_Ids | ForEach-Object { $_.ToLowerInvariant() })
-        $currentActions = @($preference.AttackSurfaceReductionRules_Actions)
+        $currentRules = @()
+        $currentActions = @()
+        
+        if ($preference.AttackSurfaceReductionRules_Ids) {
+            $currentRules = @($preference.AttackSurfaceReductionRules_Ids | ForEach-Object { $_.ToLowerInvariant() })
+        }
+        if ($preference.AttackSurfaceReductionRules_Actions) {
+            $currentActions = @($preference.AttackSurfaceReductionRules_Actions)
+        }
         
         # Build mapping of current rule states
         $ruleState = @{}
@@ -725,8 +733,15 @@ function Set-ASRRules {
     } -ChangeScript {
         try {
             $preference = Get-MpPrefSafe
-            $currentRules = @($preference.AttackSurfaceReductionRules_Ids | ForEach-Object { $_.ToLowerInvariant() })
-            $currentActions = @($preference.AttackSurfaceReductionRules_Actions)
+            $currentRules = @()
+            $currentActions = @()
+            
+            if ($preference.AttackSurfaceReductionRules_Ids) {
+                $currentRules = @($preference.AttackSurfaceReductionRules_Ids | ForEach-Object { $_.ToLowerInvariant() })
+            }
+            if ($preference.AttackSurfaceReductionRules_Actions) {
+                $currentActions = @($preference.AttackSurfaceReductionRules_Actions)
+            }
             
             # Build deterministic arrays for Set-MpPreference (preserves ID↔action alignment)
             $finalIds = New-Object System.Collections.Generic.List[string]
@@ -851,9 +866,18 @@ function Set-BitLockerConfiguration {
                 Log "Resuming BitLocker protection on already encrypted volume" "INFO"
                 Resume-BitLocker -MountPoint $systemDrive -ErrorAction Stop
             } else {
-                Log "Enabling BitLocker with TPM protector" "INFO"
-                # Enable BitLocker with TPM protector and used space only for faster encryption
-                Enable-BitLocker -MountPoint $systemDrive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -ErrorAction Stop
+                # Check if TPM protector already exists
+                $volume = Get-BitLockerVolume -MountPoint $systemDrive -ErrorAction SilentlyContinue
+                $hasTpmProtector = $volume -and ($volume.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'Tpm' })
+                
+                if ($hasTpmProtector) {
+                    Log "TPM protector already exists, resuming BitLocker protection" "INFO"
+                    # When TPM protector exists, use Resume-BitLocker instead of Enable-BitLocker
+                    Resume-BitLocker -MountPoint $systemDrive -ErrorAction Stop
+                } else {
+                    Log "Enabling BitLocker with TPM protector" "INFO"
+                    Enable-BitLocker -MountPoint $systemDrive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -SkipHardwareTest -ErrorAction Stop
+                }
             }
             
             # Add recovery password protector if not already present
@@ -1010,8 +1034,14 @@ function Set-LSAProtection {
             # Check if virtualization features are available
             $hyperVFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor -ErrorAction SilentlyContinue
             if (-not $hyperVFeature -or $hyperVFeature.State -ne "Enabled") {
-                Log "Hyper-V virtualization not available. VBS/Credential Guard requires hardware virtualization support." "WARN"
-                return $true  # Don't fail the entire process
+                # Check BIOS virtualization support
+                $vbsSupport = Get-CimInstance -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+                if ($vbsSupport -and $vbsSupport.VirtualizationBasedSecurityStatus -eq 2) {
+                    Log "VBS hardware requirements met, but Hyper-V feature not enabled. VBS/Credential Guard configured anyway." "WARN"
+                } else {
+                    Log "Hardware virtualization not available or not enabled in BIOS. VBS/Credential Guard requires: Intel VT-x/AMD-V, SLAT, TPM 2.0. Check BIOS settings." "WARN"
+                }
+                return $true  # Don't fail the entire process, but still configure registry settings
             }
             
             $deviceGuardPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
@@ -2057,7 +2087,7 @@ function Set-AuditPolicy {
                 '{0cce9240-69ae-11d9-bed3-505054503030}', # Credential Validation
                 '{0cce9242-69ae-11d9-bed3-505054503030}', # Kerberos Authentication Service
                 '{0cce9243-69ae-11d9-bed3-505054503030}', # Kerberos Service Ticket Operations
-                '{0cce9251-69ae-11d9-bed3-505054503030}', # DPAPI Activity
+                # '{0cce9251-69ae-11d9-bed3-505054503030}', # DPAPI Activity (commented out - not supported on all Windows versions)
                 '{0cce9233-69ae-11d9-bed3-505054503030}', # Sensitive Privilege Use
                 '{0cce9232-69ae-11d9-bed3-505054503030}', # Security System Extension
                 '{0cce9235-69ae-11d9-bed3-505054503030}', # System Integrity
@@ -2070,11 +2100,14 @@ function Set-AuditPolicy {
             
             foreach ($guid in $auditsToEnable) {
                 try {
-                    & auditpol.exe /set /subcategory:"$guid" /success:enable /failure:enable | Out-Null
-                    Log "Enabled audit policy for GUID: $guid" "INFO"
+                    $result = & auditpol.exe /set /subcategory:"$guid" /success:enable /failure:enable 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        Log "Enabled audit policy for GUID: $guid" "INFO"
+                    } else {
+                        Log "Failed to enable audit policy for GUID $guid (Exit code: $LASTEXITCODE): $result" "WARN"
+                    }
                 } catch {
                     Log "Failed to enable audit policy for GUID $guid`: $_" "WARN"
-                    $success = $false
                 }
             }
             
@@ -2275,7 +2308,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     else                                  { 0 }
         
         if ($summaryPath) {
-            Write-Host $summaryPath
+            Write-Host $summaryPath -NoNewline
         }
         
         exit $exitCode
