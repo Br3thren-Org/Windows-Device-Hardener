@@ -88,7 +88,7 @@
     
 .NOTES
     Author: Windows Endpoint Security Team
-    Version: 2.0.0 - Complete CISA/NSA Integration
+    Version: 2.2.0 - Enhanced with Pre-flight Checks and Compliance Reporting
     Requires: Windows 10/11, PowerShell 5.1+, Administrator privileges
     
     Security Levels:
@@ -140,7 +140,7 @@ param(
 )
 
 # Script-level variables
-$script:Version = "2.1.1"
+$script:Version = "2.2.0"
 $script:BackupPath = "$env:SystemDrive\HardeningBackup\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 $script:LogPath = "$env:SystemDrive\HardeningLogs"
 $script:LogFile = "$LogPath\EndpointHardener.log"
@@ -149,6 +149,9 @@ $script:ChangesApplied = 0
 $script:ErrorsEncountered = 0
 $script:ComplianceResults = @{}
 $script:StartTime = Get-Date
+$script:TotalOperations = 0
+$script:CompletedOperations = 0
+$script:UseProgress = $true
 
 # Handle comma-separated ASR input
 if ($ASRRules.Count -eq 1 -and $ASRRules[0] -match ',') {
@@ -210,7 +213,13 @@ $script:DefaultASRRules = @(
 
 function ConvertTo-SafeInt {
     param($Value)
-    try { [int]$Value } catch { -1 }
+    try {
+        if ($null -eq $Value) { return -1 }
+        [int]$Value
+    } catch {
+        Log "Failed to convert value to int: $Value" "DEBUG"
+        return -1
+    }
 }
 
 function Test-TamperProtectionEnabled {
@@ -224,10 +233,23 @@ function Test-TamperProtectionEnabled {
 }
 
 function Test-PendingReboot {
-    $rebootPending = $false
-    $rebootPending = $rebootPending -or (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue) -ne $null
-    $rebootPending = $rebootPending -or (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue) -ne $null
-    return $rebootPending
+    try {
+        $rebootPending = $false
+
+        # Check Windows Update reboot flag
+        $rebootPending = $rebootPending -or ($null -ne (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue))
+
+        # Check pending file rename operations
+        $rebootPending = $rebootPending -or ($null -ne (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue))
+
+        # Check Component-Based Servicing reboot flag
+        $rebootPending = $rebootPending -or ($null -ne (Get-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" -ErrorAction SilentlyContinue))
+
+        return $rebootPending
+    } catch {
+        Log "Error checking pending reboot status: $_" "WARN"
+        return $false
+    }
 }
 
 function Export-ASRState {
@@ -400,6 +422,23 @@ function Export-ServiceState {
     }
 }
 
+function Update-Progress {
+    param(
+        [string]$Activity = "Windows Endpoint Hardening",
+        [string]$Status = "Processing..."
+    )
+
+    if ($script:UseProgress -and -not $Silent -and -not $LogOnly -and $script:TotalOperations -gt 0) {
+        $script:CompletedOperations++
+        $percentComplete = [math]::Min(100, [math]::Round(($script:CompletedOperations / $script:TotalOperations) * 100, 0))
+
+        Write-Progress -Activity $Activity `
+            -Status $Status `
+            -PercentComplete $percentComplete `
+            -CurrentOperation "$script:CompletedOperations of $script:TotalOperations operations completed"
+    }
+}
+
 function Do-Change {
     param(
         [Parameter(Mandatory)]
@@ -411,22 +450,23 @@ function Do-Change {
         [scriptblock]$ChangeScript,
         [switch]$RequiresReboot
     )
-    
+
     Log "Processing: $Description" "INFO"
-    
+    Update-Progress -Status $Description
+
     try {
         $currentState = & $TestScript
-        
+
         if ($currentState) {
             Log "Already configured: $Description" "INFO"
             return $true
         }
-        
+
         if ($Preview) {
             Log "PREVIEW: Would apply change - $Description" "WARN"
             return $true
         }
-        
+
         if ($BackupScript -and -not $NoBackup) {
             Log "Creating backup for: $Description" "DEBUG"
             $backupResult = & $BackupScript
@@ -436,18 +476,18 @@ function Do-Change {
                 return $false
             }
         }
-        
+
         Log "Applying change: $Description" "INFO"
         $changeResult = & $ChangeScript
-        
+
         if ($changeResult) {
             Log "Successfully applied: $Description" "SUCCESS"
             $script:ChangesApplied++
-            
+
             if ($RequiresReboot) {
                 $script:RebootRequired = $true
             }
-            
+
             return $true
         }
         else {
@@ -1910,37 +1950,198 @@ function Set-EventLogHardening {
 
 #region Main Execution Functions
 
+function Test-SystemCompatibility {
+    <#
+    .SYNOPSIS
+    Validates system compatibility before hardening begins
+    #>
+
+    Log "Running pre-flight system compatibility checks..." "INFO"
+    $issues = @()
+    $warnings = @()
+
+    # Check Windows version
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $osVersion = [Version]$os.Version
+
+        if ($osVersion.Major -lt 10) {
+            $issues += "Unsupported Windows version: $($os.Caption). Requires Windows 10 or later."
+        } else {
+            Log "OS Version: $($os.Caption) - Compatible" "SUCCESS"
+        }
+
+        # Check build number for Windows 10/11
+        if ($osVersion.Build -lt 14393) {
+            $warnings += "Windows build $($osVersion.Build) detected. Some features require build 14393 or later."
+        }
+    } catch {
+        $issues += "Failed to detect Windows version: $_"
+    }
+
+    # Check PowerShell version
+    if ($PSVersionTable.PSVersion.Major -lt 5) {
+        $issues += "PowerShell version $($PSVersionTable.PSVersion) is too old. Requires PowerShell 5.1 or later."
+    } else {
+        Log "PowerShell Version: $($PSVersionTable.PSVersion) - Compatible" "SUCCESS"
+    }
+
+    # Check Administrator privileges
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $issues += "Script must be run with Administrator privileges"
+    } else {
+        Log "Administrator privileges: Confirmed" "SUCCESS"
+    }
+
+    # Check for Windows Defender
+    try {
+        $defenderStatus = Get-Service -Name "WinDefend" -ErrorAction SilentlyContinue
+        if (-not $defenderStatus) {
+            $warnings += "Windows Defender service not found. Some hardening features may not be available."
+        } else {
+            Log "Windows Defender: Available" "SUCCESS"
+        }
+    } catch {
+        $warnings += "Unable to verify Windows Defender status: $_"
+    }
+
+    # Check available disk space
+    try {
+        $systemDrive = Get-PSDrive -Name ($env:SystemDrive.Trim(':'))
+        $freeSpaceGB = [math]::Round($systemDrive.Free / 1GB, 2)
+
+        if ($freeSpaceGB -lt 1) {
+            $issues += "Insufficient disk space: ${freeSpaceGB}GB free. At least 1GB required for backup operations."
+        } elseif ($freeSpaceGB -lt 5) {
+            $warnings += "Low disk space: ${freeSpaceGB}GB free. Consider freeing up space before continuing."
+        } else {
+            Log "Disk Space: ${freeSpaceGB}GB available - Sufficient" "SUCCESS"
+        }
+    } catch {
+        $warnings += "Unable to check disk space: $_"
+    }
+
+    # Check for conflicting security software
+    try {
+        $avProducts = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
+        if ($avProducts) {
+            $thirdPartyAV = $avProducts | Where-Object { $_.displayName -notmatch "Windows Defender|Microsoft" }
+            if ($thirdPartyAV) {
+                $warnings += "Third-party antivirus detected: $($thirdPartyAV.displayName -join ', '). May conflict with Windows Defender hardening."
+            }
+        }
+    } catch {
+        # SecurityCenter2 may not be available on all systems
+        Log "Unable to query SecurityCenter2 for AV products" "DEBUG"
+    }
+
+    # Check Windows edition
+    try {
+        $edition = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "EditionID").EditionID
+        if ($edition -notmatch "Professional|Enterprise|Education") {
+            $warnings += "Windows edition is '$edition'. Some features require Professional, Enterprise, or Education editions."
+        } else {
+            Log "Windows Edition: $edition - Compatible" "SUCCESS"
+        }
+    } catch {
+        $warnings += "Unable to determine Windows edition"
+    }
+
+    # Check for Hyper-V capability (for HVCI/Credential Guard)
+    if ($SecurityLevel -eq "Maximum") {
+        try {
+            $hyperV = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor -ErrorAction SilentlyContinue
+            if ($hyperV -and $hyperV.State -ne "Enabled") {
+                $warnings += "Hyper-V not enabled. Virtualization-based security features (HVCI, Credential Guard) may not be available."
+            }
+        } catch {
+            Log "Unable to check Hyper-V status" "DEBUG"
+        }
+    }
+
+    # Report findings
+    if ($issues.Count -gt 0) {
+        Log "CRITICAL COMPATIBILITY ISSUES DETECTED:" "ERROR"
+        foreach ($issue in $issues) {
+            Log "  - $issue" "ERROR"
+        }
+        Log "Cannot continue. Please resolve the above issues and try again." "ERROR"
+
+        if (-not $Preview) {
+            Stop-Transcript -ErrorAction SilentlyContinue
+            exit 1603
+        }
+        return $false
+    }
+
+    if ($warnings.Count -gt 0) {
+        Log "Compatibility warnings detected:" "WARN"
+        foreach ($warning in $warnings) {
+            Log "  - $warning" "WARN"
+        }
+        Log "Continuing with hardening process..." "WARN"
+    }
+
+    Log "Pre-flight checks completed successfully" "SUCCESS"
+    return $true
+}
+
 function Initialize-Script {
     # Create directories
     if (-not (Test-Path $script:LogPath)) {
         New-Item -Path $script:LogPath -ItemType Directory -Force | Out-Null
     }
-    
+
     if (-not $NoBackup -and -not (Test-Path $script:BackupPath)) {
         New-Item -Path $script:BackupPath -ItemType Directory -Force | Out-Null
     }
-    
+
     # Start transcript
     try {
         Start-Transcript -Path "$script:LogPath\Transcript-$(Get-Date -Format 'yyyyMMdd-HHmmss').log" -ErrorAction SilentlyContinue
     } catch {
         Log "Failed to start transcript: $_" "WARN"
     }
-    
-    Log "Windows Endpoint Hardener Complete v$script:Version" "INFO"
+
+    Log "=============================================================" "INFO"
+    Log "  Windows Endpoint Hardener Complete v$script:Version" "INFO"
+    Log "=============================================================" "INFO"
     Log "Security Level: $SecurityLevel" "INFO"
     Log "Preview Mode: $Preview" "INFO"
     Log "Enterprise Mode: $EnterpriseMode" "INFO"
     Log "Standalone Mode: $StandaloneMode" "INFO"
-    
+
     if (-not $Preview) {
         Log "Backup Path: $script:BackupPath" "INFO"
     }
-    
+
+    Log "=============================================================" "INFO"
+
+    # Run pre-flight compatibility checks
+    if (-not (Test-SystemCompatibility)) {
+        Log "Pre-flight checks failed. Exiting..." "ERROR"
+        exit 1603
+    }
+
+    Log "=============================================================" "INFO"
+
     # Check for pending reboot
     if (Test-PendingReboot) {
-        Log "Pending reboot detected - some changes may not take effect until after reboot" "WARN"
+        Log "WARNING: Pending reboot detected" "WARN"
+        Log "Some changes may not take effect until after reboot" "WARN"
+        Log "Consider rebooting before continuing for best results" "WARN"
     }
+
+    # Estimate total operations for progress tracking
+    $script:TotalOperations = switch ($SecurityLevel) {
+        "Quick" { 30 }
+        "Standard" { 80 }
+        "Maximum" { 150 }
+    }
+
+    Log "Estimated operations: $script:TotalOperations" "INFO"
+    Log "=============================================================" "INFO"
 }
 
 function Start-HardeningProcess {
@@ -2016,30 +2217,220 @@ function Start-HardeningProcess {
 
 function New-ComplianceReport {
     if ($ComplianceReport) {
-        Log "Generating compliance report" "INFO"
-        
+        Log "Generating comprehensive compliance report" "INFO"
+
+        # Gather system security posture
+        $defenderPref = Get-MpPreference -ErrorAction SilentlyContinue
+        $bitlockerStatus = try { (Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue).ProtectionStatus -eq "On" } catch { $false }
+        $tpmInfo = Get-Tpm -ErrorAction SilentlyContinue
+        $secureBootEnabled = try { Confirm-SecureBootUEFI -ErrorAction SilentlyContinue } catch { $false }
+
+        $securityPosture = @{
+            WindowsDefender = @{
+                RealTimeProtection = if ($defenderPref) { $defenderPref.DisableRealtimeMonitoring -eq $false } else { $false }
+                CloudProtection = if ($defenderPref) { $defenderPref.MAPSReporting -ne 0 } else { $false }
+                NetworkProtection = if ($defenderPref) { $defenderPref.EnableNetworkProtection -eq 1 } else { $false }
+                PUAProtection = if ($defenderPref) { $defenderPref.PUAProtection -eq 1 } else { $false }
+            }
+            BitLocker = @{
+                SystemDriveEncrypted = $bitlockerStatus
+            }
+            Firewall = @{
+                DomainProfile = (Get-NetFirewallProfile -Profile Domain -ErrorAction SilentlyContinue).Enabled
+                PrivateProfile = (Get-NetFirewallProfile -Profile Private -ErrorAction SilentlyContinue).Enabled
+                PublicProfile = (Get-NetFirewallProfile -Profile Public -ErrorAction SilentlyContinue).Enabled
+            }
+            UAC = @{
+                Enabled = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -ErrorAction SilentlyContinue).EnableLUA -eq 1
+            }
+            TPM = @{
+                Present = if ($tpmInfo) { $tpmInfo.TpmPresent } else { $false }
+                Ready = if ($tpmInfo) { $tpmInfo.TpmReady } else { $false }
+            }
+            SecureBoot = @{
+                Enabled = $secureBootEnabled
+            }
+        }
+
+        # Calculate compliance score
+        $totalChecks = 0
+        $passedChecks = 0
+
+        foreach ($category in $securityPosture.Keys) {
+            foreach ($check in $securityPosture[$category].Keys) {
+                $totalChecks++
+                if ($securityPosture[$category][$check] -eq $true) {
+                    $passedChecks++
+                }
+            }
+        }
+
+        $complianceScore = if ($totalChecks -gt 0) {
+            [math]::Round(($passedChecks / $totalChecks) * 100, 2)
+        } else { 0 }
+
         $reportData = @{
-            Version = $script:Version
-            SecurityLevel = $SecurityLevel
-            ExecutionTime = (Get-Date) - $script:StartTime
-            ChangesApplied = $script:ChangesApplied
-            ErrorsEncountered = $script:ErrorsEncountered
-            RebootRequired = $script:RebootRequired
-            ComplianceResults = $script:ComplianceResults
-            SystemInfo = @{
+            ReportMetadata = @{
+                Version = $script:Version
+                ReportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                ReportType = "Windows Endpoint Security Compliance"
+            }
+            ExecutionSummary = @{
+                SecurityLevel = $SecurityLevel
+                ExecutionTime = (Get-Date) - $script:StartTime | Select-Object -ExpandProperty TotalSeconds
+                ExecutionTimeFormatted = ((Get-Date) - $script:StartTime).ToString('hh\:mm\:ss')
+                ChangesApplied = $script:ChangesApplied
+                ErrorsEncountered = $script:ErrorsEncountered
+                RebootRequired = $script:RebootRequired
+                PreviewMode = $Preview.IsPresent
+                EnterpriseMode = $EnterpriseMode.IsPresent
+                StandaloneMode = $StandaloneMode.IsPresent
+            }
+            ComplianceScore = @{
+                OverallScore = $complianceScore
+                TotalChecks = $totalChecks
+                PassedChecks = $passedChecks
+                FailedChecks = $totalChecks - $passedChecks
+                Rating = switch ($complianceScore) {
+                    { $_ -ge 90 } { "Excellent" }
+                    { $_ -ge 75 } { "Good" }
+                    { $_ -ge 60 } { "Fair" }
+                    { $_ -ge 40 } { "Poor" }
+                    default { "Critical" }
+                }
+            }
+            SecurityPosture = $securityPosture
+            ComplianceIssues = $script:ComplianceResults
+            SystemInformation = @{
                 ComputerName = $env:COMPUTERNAME
                 OSVersion = (Get-CimInstance Win32_OperatingSystem).Caption
+                OSBuild = (Get-CimInstance Win32_OperatingSystem).BuildNumber
+                OSArchitecture = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
                 PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+                DomainJoined = (Get-CimInstance Win32_ComputerSystem).PartOfDomain
+                DomainName = (Get-CimInstance Win32_ComputerSystem).Domain
                 ExecutedBy = $env:USERNAME
                 ExecutionDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             }
+            Recommendations = @()
         }
-        
-        $reportJson = $reportData | ConvertTo-Json -Depth 4
+
+        # Add recommendations based on findings
+        if ($script:RebootRequired) {
+            $reportData.Recommendations += "System reboot is required to complete hardening changes"
+        }
+        if ($script:ErrorsEncountered -gt 0) {
+            $reportData.Recommendations += "Review error log for $($script:ErrorsEncountered) failed operations"
+        }
+        if ($complianceScore -lt 80) {
+            $reportData.Recommendations += "Consider running at a higher security level for improved compliance"
+        }
+        if (-not $securityPosture.BitLocker.SystemDriveEncrypted) {
+            $reportData.Recommendations += "Enable BitLocker encryption for data protection"
+        }
+        if (-not $securityPosture.SecureBoot.Enabled) {
+            $reportData.Recommendations += "Enable Secure Boot in UEFI firmware for boot security"
+        }
+
+        # Save JSON report
+        $reportJson = $reportData | ConvertTo-Json -Depth 6
         $reportPath = "$script:LogPath\ComplianceReport-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
         $reportJson | Out-File -FilePath $reportPath -Encoding UTF8
-        
-        Log "Compliance report saved: $reportPath" "INFO"
+
+        Log "Compliance report saved: $reportPath" "SUCCESS"
+
+        # Generate HTML report if possible
+        try {
+            $htmlPath = "$script:LogPath\ComplianceReport-$(Get-Date -Format 'yyyyMMdd-HHmmss').html"
+            $htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Windows Endpoint Security Compliance Report</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #0078D4; border-bottom: 3px solid #0078D4; padding-bottom: 10px; }
+        h2 { color: #106EBE; margin-top: 30px; }
+        .score { font-size: 48px; font-weight: bold; color: #107C10; text-align: center; margin: 20px 0; }
+        .rating { font-size: 24px; text-align: center; color: #666; }
+        .summary { background: #f0f0f0; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        .good { color: #107C10; }
+        .warn { color: #FF8C00; }
+        .error { color: #D13438; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #0078D4; color: white; }
+        tr:hover { background-color: #f5f5f5; }
+        .status-pass { color: #107C10; font-weight: bold; }
+        .status-fail { color: #D13438; font-weight: bold; }
+        .recommendations { background: #FFF4CE; padding: 15px; border-left: 4px solid #FF8C00; margin: 20px 0; }
+        .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Windows Endpoint Security Compliance Report</h1>
+        <div class="summary">
+            <strong>Computer:</strong> $env:COMPUTERNAME<br>
+            <strong>Report Date:</strong> $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")<br>
+            <strong>Security Level:</strong> $SecurityLevel<br>
+            <strong>Execution Time:</strong> $($reportData.ExecutionSummary.ExecutionTimeFormatted)
+        </div>
+
+        <h2>Compliance Score</h2>
+        <div class="score">$complianceScore%</div>
+        <div class="rating">Rating: $($reportData.ComplianceScore.Rating)</div>
+        <p style="text-align: center;">$passedChecks of $totalChecks security checks passed</p>
+
+        <h2>Execution Summary</h2>
+        <table>
+            <tr><td><strong>Changes Applied</strong></td><td class="good">$($script:ChangesApplied)</td></tr>
+            <tr><td><strong>Errors Encountered</strong></td><td class="$(if($script:ErrorsEncountered -gt 0){'error'}else{'good'})">$($script:ErrorsEncountered)</td></tr>
+            <tr><td><strong>Reboot Required</strong></td><td class="$(if($script:RebootRequired){'warn'}else{'good'})">$($script:RebootRequired)</td></tr>
+        </table>
+
+        <h2>Security Posture</h2>
+        <table>
+            <tr><th>Category</th><th>Check</th><th>Status</th></tr>
+"@
+            foreach ($category in $securityPosture.Keys | Sort-Object) {
+                foreach ($check in $securityPosture[$category].Keys | Sort-Object) {
+                    $status = $securityPosture[$category][$check]
+                    $statusText = if ($status) { "PASS" } else { "FAIL" }
+                    $statusClass = if ($status) { "status-pass" } else { "status-fail" }
+                    $htmlContent += "            <tr><td>$category</td><td>$check</td><td class='$statusClass'>$statusText</td></tr>`n"
+                }
+            }
+
+            $htmlContent += @"
+        </table>
+
+        <h2>Recommendations</h2>
+        <div class="recommendations">
+            <ul>
+"@
+            foreach ($rec in $reportData.Recommendations) {
+                $htmlContent += "                <li>$rec</li>`n"
+            }
+
+            $htmlContent += @"
+            </ul>
+        </div>
+
+        <div class="footer">
+            Windows Endpoint Hardener Complete v$($script:Version)<br>
+            Generated by: $env:USERNAME
+        </div>
+    </div>
+</body>
+</html>
+"@
+            $htmlContent | Out-File -FilePath $htmlPath -Encoding UTF8
+            Log "HTML compliance report saved: $htmlPath" "SUCCESS"
+        } catch {
+            Log "Failed to generate HTML report: $_" "WARN"
+        }
     }
 }
 
